@@ -36,4 +36,31 @@ Reply ONLY with the answer to fill in, nothing else.`;
     return answer;
 }
 
-module.exports = { answerSecurityField, NOT_A_QUESTION };
+// Ask Claude for a password that satisfies the forum's detected rules.
+async function generatePasswordFromRules(detectedRules) {
+    const prompt = `Generate a valid password for a forum with these rules : ${detectedRules}
+The password must also be minimum 12 characters, contain uppercase, lowercase, number and special character.
+Reply ONLY with the password, nothing else.`;
+
+    const response = await anthropic.messages.create({
+        model: config.claude.model,
+        max_tokens: 80,
+        messages: [{ role: 'user', content: prompt }],
+    });
+
+    const password = (response.content || [])
+        .filter((block) => block.type === 'text')
+        .map((block) => block.text)
+        .join('')
+        .trim()
+        // Strip accidental quotes/backticks Claude sometimes wraps around the answer.
+        .replace(/^["'`]+|["'`]+$/g, '')
+        .split(/\s+/)[0];
+
+    if (!password || password.length < 8) {
+        throw new Error('Claude did not return a usable password');
+    }
+    return password;
+}
+
+module.exports = { answerSecurityField, generatePasswordFromRules, NOT_A_QUESTION };

@@ -52,11 +52,14 @@ async function processForum(browser, forum) {
 
         await supabase.setAttempts(forum.id, attempts);
 
+        const passwordUpdate = result.password ? { mot_de_passe: result.password } : {};
+
         // Step 5 — account already exists.
         if (result.status === 'compte_preexistant') {
             await supabase.updateForum(forum.id, {
                 inscription_status: 'compte_preexistant',
                 inscription_attempts: attempts,
+                ...passwordUpdate,
             });
             await log(forum, { status: 'success', extra: logExtra });
             logger.info(`[forum ${forum.id}] account already exists`);
@@ -68,6 +71,7 @@ async function processForum(browser, forum) {
             await supabase.updateForum(forum.id, {
                 inscription_status: APPROVAL_STATUS,
                 inscription_attempts: attempts,
+                ...passwordUpdate,
             });
             await log(forum, { status: 'success', extra: logExtra });
             logger.info(`[forum ${forum.id}] awaiting admin approval (watched for up to 7 days)`);
@@ -79,6 +83,7 @@ async function processForum(browser, forum) {
             await supabase.updateForum(forum.id, {
                 inscription_status: 'confirmation_pending',
                 inscription_attempts: attempts,
+                ...passwordUpdate,
             });
             await log(forum, { status: 'success', extra: logExtra });
             logger.info(`[forum ${forum.id}] submitted, waiting for confirmation email`);
@@ -94,6 +99,7 @@ async function processForum(browser, forum) {
                     await supabase.updateForum(forum.id, {
                         inscription_status: 'inscrit',
                         date_inscription: new Date().toISOString(),
+                        ...passwordUpdate,
                     });
                     await log(forum, {
                         status: 'success',
@@ -117,6 +123,7 @@ async function processForum(browser, forum) {
         await supabase.updateForum(forum.id, {
             inscription_attempts: attempts,
             inscription_error: result.error || 'Unknown error',
+            ...passwordUpdate,
         });
         await log(forum, { status: 'error', extra: logExtra });
         logger.error(`[forum ${forum.id}] attempt ${attempts} failed: ${result.error}`);

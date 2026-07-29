@@ -1,10 +1,11 @@
 const { Solver } = require('@2captcha/captcha-solver');
 const { config } = require('./config');
 const { createContext, humanClick, humanType, humanMouseWander, delay, rand } = require('./browser');
-const { answerSecurityField } = require('./claude');
+const { answerSecurityField, generatePasswordFromRules } = require('./claude');
 const logger = require('./logger');
 
 const solver = config.twoCaptchaKey ? new Solver(config.twoCaptchaKey) : null;
+const MAX_PASSWORD_ATTEMPTS = 3;
 
 // Step 3 — field selectors.
 const USERNAME_SELECTORS = [
@@ -30,9 +31,6 @@ const SUBMIT_SELECTORS = [
     'input[name*="register" i]',
 ];
 
-// Names/ids we must never treat as a security question.
-const NON_QUESTION_RE = /user|pseudo|username|email|mail|pass|captch|confirm_code|vc_|securitycode|token|csrf/i;
-
 const RESPONSE_PATTERNS = {
     compte_preexistant: [
         'already in use', 'already registered', 'already taken', 'already exists',
@@ -49,12 +47,47 @@ const RESPONSE_PATTERNS = {
         'validation par un administrateur', 'validé par un administrateur',
         'approuvé par un administrateur', 'sera validé', 'après validation',
     ],
+    // Password policy rejections — retried with a Claude-generated password.
+    password_rejected: [
+        'password too short', 'mot de passe trop court', 'password is too short',
+        'must contain uppercase', 'must contain lowercase', 'must contain a number',
+        'must contain a special', 'must include uppercase', 'must include lowercase',
+        'caractère spécial requis', 'caractere special requis',
+        'majuscule', 'minuscule', 'special character', 'special characters',
+        'au moins', 'at least', 'minimum', 'trop faible', 'too weak',
+        'password requirements', 'exigences du mot de passe',
+        'password must', 'le mot de passe doit', 'invalid password', 'mot de passe invalide',
+        'password does not meet', 'ne respecte pas',
+    ],
     failure: [
         'error', 'erreur', 'invalid', 'invalide', 'incorrect', 'not match',
         'ne correspond', 'trop court', 'too short', 'required', 'obligatoire',
         'captcha', 'failed', 'échoué',
     ],
 };
+
+function generatePassword() {
+    const upper = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+    const lower = 'abcdefghijklmnopqrstuvwxyz';
+    const numbers = '0123456789';
+    const special = '!@#$%^&*?';
+    const all = upper + lower + numbers + special;
+
+    let password = '';
+    // Guarantee at least one of each required type
+    password += upper[Math.floor(Math.random() * upper.length)];
+    password += lower[Math.floor(Math.random() * lower.length)];
+    password += numbers[Math.floor(Math.random() * numbers.length)];
+    password += special[Math.floor(Math.random() * special.length)];
+
+    // Fill remaining 8 characters randomly
+    for (let i = 0; i < 8; i++) {
+        password += all[Math.floor(Math.random() * all.length)];
+    }
+
+    // Shuffle to avoid predictable pattern (upper always first)
+    return password.split('').sort(() => Math.random() - 0.5).join('');
+}
 
 async function firstVisible(page, selectors) {
     const list = Array.isArray(selectors) ? selectors : [selectors];
@@ -89,6 +122,33 @@ async function fillPasswords(page, value) {
         }
     }
     return filled;
+}
+
+function isPasswordRejected(text) {
+    const hay = (text || '').toLowerCase();
+    return RESPONSE_PATTERNS.password_rejected.some((p) => hay.includes(p));
+}
+
+// Pull password-related rule text from the page for Claude.
+function extractPasswordRules(text) {
+    const lines = String(text || '')
+        .split(/\n+/)
+        .map((l) => l.trim())
+        .filter(Boolean);
+
+    const ruleLines = lines.filter((line) => {
+        const lower = line.toLowerCase();
+        return /pass|mot de passe|password|majuscule|minuscule|spécial|special|caractère|character|chiffre|digit|number|longueur|length|minimum|au moins|uppercase|lowercase/i
+            .test(lower);
+    });
+
+    const rules = (ruleLines.length ? ruleLines : lines)
+        .join(' | ')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 800);
+
+    return rules || 'Password was rejected. Must be stronger.';
 }
 
 // Step 4 — collect text inputs that are not username/email/password, with nearby text.
@@ -220,16 +280,26 @@ function analyzeResponse(text) {
     if (RESPONSE_PATTERNS.pending_admin_approval.some((p) => hay.includes(p))) {
         return 'pending_admin_approval';
     }
+    if (isPasswordRejected(hay)) {
+        return 'password_rejected';
+    }
     if (RESPONSE_PATTERNS.failure.some((p) => hay.includes(p))) {
         return 'inscription_failed';
     }
     return 'confirmation_pending';
 }
 
+async function refillCoreFields(page, forum, password) {
+    await fillField(page, USERNAME_SELECTORS, forum.pseudonyme_genere);
+    await fillField(page, EMAIL_SELECTORS, forum.email_utilise);
+    return fillPasswords(page, password);
+}
+
 // Steps 2-5 — one registration attempt. Returns a structured result.
 async function attemptRegistration(browser, forum) {
     const { context, fingerprint } = await createContext(browser);
     const page = await context.newPage();
+    let password = generatePassword();
     const result = {
         status: 'inscription_failed',
         error: null,
@@ -237,6 +307,8 @@ async function attemptRegistration(browser, forum) {
         securityQuestions: [],
         fingerprint,
         submittedAt: null,
+        password,
+        passwordAttempts: 0,
     };
 
     try {
@@ -244,9 +316,10 @@ async function attemptRegistration(browser, forum) {
         await humanMouseWander(page);
         await delay(rand(800, 2000));
 
+        logger.info(`[password] generated for forum ${forum.id}`);
         const gotUser = await fillField(page, USERNAME_SELECTORS, forum.pseudonyme_genere);
         const gotEmail = await fillField(page, EMAIL_SELECTORS, forum.email_utilise);
-        const gotPass = await fillPasswords(page, forum.mot_de_passe);
+        const gotPass = await fillPasswords(page, password);
 
         if (!gotUser && !gotEmail && !gotPass) {
             result.error = 'No recognizable registration fields on the page';
@@ -254,19 +327,61 @@ async function attemptRegistration(browser, forum) {
         }
 
         result.securityQuestions = await handleSecurityFields(page);
-        result.captchaType = await trySolveImageCaptcha(page);
 
-        await delay(rand(400, 1200));
-        result.submittedAt = new Date();
-        await clickSubmit(page);
-        await page.waitForLoadState('domcontentloaded', { timeout: 60000 }).catch(() => {});
-        await delay(3000);
+        for (let pwdAttempt = 1; pwdAttempt <= MAX_PASSWORD_ATTEMPTS; pwdAttempt++) {
+            result.passwordAttempts = pwdAttempt;
+            result.password = password;
 
-        const bodyText = await page.evaluate(() => document.body.innerText).catch(() => '');
-        result.status = analyzeResponse(bodyText);
-        if (result.status === 'inscription_failed') {
-            result.error = bodyText.replace(/\s+/g, ' ').trim().slice(0, 500) || 'Unknown error';
+            result.captchaType = await trySolveImageCaptcha(page) || result.captchaType;
+
+            await delay(rand(400, 1200));
+            result.submittedAt = new Date();
+            await clickSubmit(page);
+            await page.waitForLoadState('domcontentloaded', { timeout: 60000 }).catch(() => {});
+            await delay(3000);
+
+            const bodyText = await page.evaluate(() => document.body.innerText).catch(() => '');
+            result.status = analyzeResponse(bodyText);
+
+            if (result.status !== 'password_rejected') {
+                if (result.status === 'inscription_failed') {
+                    result.error = bodyText.replace(/\s+/g, ' ').trim().slice(0, 500) || 'Unknown error';
+                }
+                return result;
+            }
+
+            result.error = bodyText.replace(/\s+/g, ' ').trim().slice(0, 500) || 'Password rejected';
+            logger.warn(`[password] rejected on attempt ${pwdAttempt}/${MAX_PASSWORD_ATTEMPTS}`);
+
+            if (pwdAttempt >= MAX_PASSWORD_ATTEMPTS) {
+                result.status = 'inscription_failed';
+                return result;
+            }
+
+            const detectedRules = extractPasswordRules(bodyText);
+            try {
+                password = await generatePasswordFromRules(detectedRules);
+                result.password = password;
+                logger.info(`[password] Claude generated a new password for attempt ${pwdAttempt + 1}`);
+            } catch (err) {
+                logger.error(`[password] Claude generation failed: ${err.message}`);
+                password = generatePassword();
+                result.password = password;
+                logger.info('[password] fell back to local generator');
+            }
+
+            // If the form is gone after submit, reload and refill everything.
+            const stillOnForm = await page.locator(PASSWORD_SELECTOR).first().isVisible().catch(() => false);
+            if (!stillOnForm) {
+                await page.goto(forum.lien_inscription, { waitUntil: 'domcontentloaded', timeout: 60000 });
+                await delay(rand(800, 1600));
+                await refillCoreFields(page, forum, password);
+                result.securityQuestions = await handleSecurityFields(page);
+            } else {
+                await fillPasswords(page, password);
+            }
         }
+
         return result;
     } catch (err) {
         result.status = 'inscription_failed';
@@ -293,4 +408,10 @@ async function visitConfirmationLink(browser, link) {
     }
 }
 
-module.exports = { attemptRegistration, visitConfirmationLink, analyzeResponse };
+module.exports = {
+    attemptRegistration,
+    visitConfirmationLink,
+    analyzeResponse,
+    generatePassword,
+    isPasswordRejected,
+};
